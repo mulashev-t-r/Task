@@ -1,0 +1,14 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: true
+  liquibase:
+    change-log: classpath:db/changelog/db.changelog-master.yaml
+
+app:
+  schedule:
+    producer-ms: 100
+    flush-ms: 100
+    reconnect-ms: 500
+  slow-write-threshold-ms: 200
