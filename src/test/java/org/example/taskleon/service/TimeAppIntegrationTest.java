@@ -1,6 +1,5 @@
 package org.example.taskleon.service;
 
-import com.github.dockerjava.api.DockerClient;
 import org.example.taskleon.Model.TimeRecord;
 import org.example.taskleon.Repository.TimeRecordRepository;
 import org.example.taskleon.Service.TimeRecordService;
@@ -19,7 +18,9 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import java.time.LocalDateTime;
 import java.util.List;
 
+import static java.time.Duration.ofSeconds;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 @SpringBootTest
 @Testcontainers
@@ -57,46 +58,105 @@ class TimeAppIntegrationTest {
     }
 
     @Test
-    void schedulerWritesRecordsToDatabase() throws Exception {
-        Thread.sleep(1500);
-
-        long count = repository.count();
-        assertThat(count).isGreaterThan(0L);
+    void schedulerWritesRecordsToDatabase() {
+        await()
+                .atMost(ofSeconds(5))
+                .untilAsserted(() -> assertThat(repository.count()).isGreaterThan(0L));
     }
 
     @Test
-    void dbPauseAndResume_bufferIsFlushedAndOrderIsAscending() throws Exception {
-        Thread.sleep(2000);
-        List<TimeRecord> beforePause = repository.findAll();
-        int beforeCount = beforePause.size();
-        assertThat(beforeCount).isGreaterThan(0);
+    void dbPauseAndResume_bufferIsFlushedAndOrderIsAscending() {
+        await()
+                .atMost(ofSeconds(5))
+                .untilAsserted(() -> assertThat(repository.count()).isGreaterThan(0L));
 
-        DockerClient dockerClient = DockerClientFactory.instance().client();
-        dockerClient.pauseContainerCmd(postgres.getContainerId()).exec();
+        long beforeCount = repository.count();
+
+        pauseDb();
 
         timeRecordService.bufferCurrentTime();
-        Thread.sleep(10);
         timeRecordService.bufferCurrentTime();
 
-        Thread.sleep(3000);
+        await()
+                .during(ofSeconds(2))
+                .atMost(ofSeconds(3))
+                .untilAsserted(() -> assertThat(repository.count()).isEqualTo(beforeCount));
 
-        dockerClient.unpauseContainerCmd(postgres.getContainerId()).exec();
+        unpauseDb();
 
-        Thread.sleep(4000);
+        await()
+                .atMost(ofSeconds(8))
+                .untilAsserted(() -> assertThat(repository.count()).isGreaterThan(beforeCount));
 
         List<TimeRecord> afterResume = repository.findAll();
-        assertThat(afterResume.size())
-                .as("после восстановления БД записей должно стать больше, данные не должны теряться")
-                .isGreaterThan(beforeCount);
+        assertThat(isNonDecreasing(afterResume)).isTrue();
+    }
 
+    @Test
+    void dbDownAtStartup_recordsBufferedAndWrittenAfterRestore() {
+        pauseDb();
+
+        await()
+                .during(ofSeconds(3))
+                .atMost(ofSeconds(4))
+                .untilAsserted(() -> assertThat(repository.count()).isZero());
+
+        unpauseDb();
+
+        await()
+                .atMost(ofSeconds(10))
+                .untilAsserted(() -> assertThat(repository.count()).isGreaterThan(0L));
+
+        List<TimeRecord> records = repository.findAll();
+        assertThat(isNonDecreasing(records)).isTrue();
+    }
+
+    @Test
+    void dbUnavailableForAWhile_thenAllBufferedRecordsPersisted() {
+        await()
+                .atMost(ofSeconds(5))
+                .untilAsserted(() -> assertThat(repository.count()).isGreaterThan(0L));
+
+        long beforeCount = repository.count();
+        pauseDb();
+
+        timeRecordService.bufferCurrentTime();
+        timeRecordService.bufferCurrentTime();
+        timeRecordService.bufferCurrentTime();
+
+        await()
+                .during(ofSeconds(2))
+                .atMost(ofSeconds(3))
+                .untilAsserted(() -> assertThat(repository.count()).isEqualTo(beforeCount));
+
+        unpauseDb();
+
+        await()
+                .atMost(ofSeconds(10))
+                .untilAsserted(() -> assertThat(repository.count()).isGreaterThan(beforeCount + 1));
+
+        List<TimeRecord> records = repository.findAll();
+        assertThat(isNonDecreasing(records)).isTrue();
+    }
+
+    private void pauseDb() {
+        var dockerClient = DockerClientFactory.instance().client();
+        dockerClient.pauseContainerCmd(postgres.getContainerId()).exec();
+    }
+
+    private void unpauseDb() {
+        var dockerClient = DockerClientFactory.instance().client();
+        dockerClient.unpauseContainerCmd(postgres.getContainerId()).exec();
+    }
+
+    private boolean isNonDecreasing(List<TimeRecord> records) {
         LocalDateTime prev = null;
-        for (TimeRecord record : afterResume) {
-            if (prev != null) {
-                assertThat(record.getCreatedAt())
-                        .as("created_at должен быть неубывающим")
-                        .isAfterOrEqualTo(prev);
+        for (TimeRecord record : records) {
+            if (prev != null && record.getCreatedAt().isBefore(prev)) {
+                return false;
             }
             prev = record.getCreatedAt();
         }
+        return true;
     }
 }
